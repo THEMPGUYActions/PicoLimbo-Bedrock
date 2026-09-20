@@ -1,0 +1,185 @@
+name: Build PicoLimbo
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: pico_limbo
+  LIB_NAME: pico_limbo_lib
+
+jobs:
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            name: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            name: linux-x86_64-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            name: linux-aarch64-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add ${{ matrix.target }}
+
+      - name: Build
+        if: ${{ endsWith(matrix.target, '-musl') }}
+        run: cargo build --release --target ${{ matrix.target }} --bin ${{ env.BINARY_NAME }}
+
+      - name: Build GNU
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        run: cargo build --release --target ${{ matrix.target }} --bin ${{ env.BINARY_NAME }}
+
+      - name: Build native library
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        run: cargo build --release --target ${{ matrix.target }} --lib
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          if [ -f "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" ]; then
+            cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" dist/
+          else
+            cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" dist/
+          fi
+          tar -C dist -czf "${{ env.BINARY_NAME }}_${{ matrix.name }}.tar.gz" .
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-${{ matrix.name }}
+          path: ${{ env.BINARY_NAME }}_${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload native library for wrapper build
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrapper-lib-${{ matrix.name }}
+          path: |
+            target/${{ matrix.target }}/release/lib${{ env.LIB_NAME }}.so
+            target/${{ matrix.target }}/release/lib${{ env.LIB_NAME }}.dylib
+            target/${{ matrix.target }}/release/${{ env.LIB_NAME }}.dll
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install target
+        run: rustup target add aarch64-apple-darwin
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin --bin ${{ env.BINARY_NAME }} --lib
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp "target/aarch64-apple-darwin/release/${{ env.BINARY_NAME }}" dist/
+          tar -C dist -czf "${{ env.BINARY_NAME }}_macos-aarch64.tar.gz" .
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-macos-aarch64
+          path: ${{ env.BINARY_NAME }}_macos-aarch64.tar.gz
+      - name: Upload native library for wrapper build
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrapper-lib-macos-aarch64
+          path: target/aarch64-apple-darwin/release/lib${{ env.LIB_NAME }}.dylib
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc --bin ${{ env.BINARY_NAME }} --lib
+      - name: Package binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/${{ env.BINARY_NAME }}.exe" dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ env.BINARY_NAME }}_windows-x86_64.zip" -Force
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-windows-x86_64
+          path: ${{ env.BINARY_NAME }}_windows-x86_64.zip
+      - name: Upload native library for wrapper build
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrapper-lib-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/${{ env.LIB_NAME }}.dll
+
+  build-java-wrapper:
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux
+      - build-macos
+      - build-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Download Linux x86_64 library
+        uses: actions/download-artifact@v4
+        with:
+          name: wrapper-lib-linux-x86_64
+          path: java_wrapper/wrapper/src/main/resources/linux/x86_64
+
+      - name: Download Linux aarch64 library
+        uses: actions/download-artifact@v4
+        with:
+          name: wrapper-lib-linux-aarch64
+          path: java_wrapper/wrapper/src/main/resources/linux/aarch64
+
+      - name: Download macOS aarch64 library
+        uses: actions/download-artifact@v4
+        with:
+          name: wrapper-lib-macos-aarch64
+          path: java_wrapper/wrapper/src/main/resources/macos/aarch64
+
+      - name: Download Windows x86_64 library
+        uses: actions/download-artifact@v4
+        with:
+          name: wrapper-lib-windows-x86_64
+          path: java_wrapper/wrapper/src/main/resources/windows/x86_64
+
+      - name: Build wrapper
+        working-directory: java_wrapper
+        run: |
+          chmod +x gradlew
+          ./gradlew build
+
+      - name: Upload Java wrapper
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-java-wrapper
+          path: java_wrapper/wrapper/build/libs/*.jar
+          if-no-files-found: error
