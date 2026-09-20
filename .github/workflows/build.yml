@@ -1,0 +1,173 @@
+name: Build PicoLimbo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: \${{ runner.os }}-cargo-\${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  native:
+    name: Native \${{ matrix.name }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            dir: linux/x86_64
+            exe: pico_limbo
+            lib: libpico_limbo_lib.so
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            dir: linux/aarch64
+            exe: pico_limbo
+            lib: libpico_limbo_lib.so
+          - name: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            dir: windows/x86_64
+            exe: pico_limbo.exe
+            lib: pico_limbo_lib.dll
+          - name: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            dir: macos/aarch64
+            exe: pico_limbo
+            lib: libpico_limbo_lib.dylib
+    runs-on: \${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: \${{ matrix.target }}
+      - name: Build
+        run: cargo build --release -p pico_limbo --target \${{ matrix.target }}
+      - name: Stage native files
+        shell: bash
+        run: |
+          mkdir -p "staging/\${{ matrix.dir }}"
+          cp "target/\${{ matrix.target }}/release/\${{ matrix.exe }}" "staging/\${{ matrix.dir }}/\${{ matrix.exe }}"
+          cp "target/\${{ matrix.target }}/release/\${{ matrix.lib }}" "staging/\${{ matrix.dir }}/\${{ matrix.lib }}"
+      - name: Upload native build
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-native-\${{ matrix.name }}
+          path: staging/
+          retention-days: 1
+
+  wrapper:
+    name: Java wrapper
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download native libraries
+        uses: actions/download-artifact@v5
+        with:
+          pattern: pico-limbo-native-*
+          path: native
+      - name: Install native resources
+        shell: bash
+        run: |
+          mkdir -p java_wrapper/wrapper/src/main/resources/linux/x86_64
+          mkdir -p java_wrapper/wrapper/src/main/resources/linux/aarch64
+          mkdir -p java_wrapper/wrapper/src/main/resources/windows/x86_64
+          mkdir -p java_wrapper/wrapper/src/main/resources/macos/aarch64
+          cp native/pico-limbo-native-linux-x86_64/linux/x86_64/libpico_limbo_lib.so java_wrapper/wrapper/src/main/resources/linux/x86_64/
+          cp native/pico-limbo-native-linux-aarch64/linux/aarch64/libpico_limbo_lib.so java_wrapper/wrapper/src/main/resources/linux/aarch64/
+          cp native/pico-limbo-native-windows-x86_64/windows/x86_64/pico_limbo_lib.dll java_wrapper/wrapper/src/main/resources/windows/x86_64/
+          cp native/pico-limbo-native-macos-aarch64/macos/aarch64/libpico_limbo_lib.dylib java_wrapper/wrapper/src/main/resources/macos/aarch64/
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build wrapper
+        working-directory: java_wrapper
+        run: ./gradlew :wrapper:jar --no-daemon
+      - name: Upload wrapper
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-java-wrapper
+          path: java_wrapper/wrapper/build/libs/pico_limbo_java_wrapper.jar
+          retention-days: 1
+
+  package:
+    name: Final build
+    needs: [native, wrapper]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download native builds
+        uses: actions/download-artifact@v5
+        with:
+          pattern: pico-limbo-native-*
+          path: native
+      - name: Download Java wrapper
+        uses: actions/download-artifact@v5
+        with:
+          name: pico-limbo-java-wrapper
+          path: build
+      - name: Package useful files
+        shell: bash
+        run: |
+          mkdir -p release/bin/linux-x86_64 release/bin/linux-aarch64 release/bin/windows-x86_64 release/bin/macos-aarch64
+          cp native/pico-limbo-native-linux-x86_64/linux/x86_64/pico_limbo release/bin/linux-x86_64/
+          cp native/pico-limbo-native-linux-aarch64/linux/aarch64/pico_limbo release/bin/linux-aarch64/
+          cp native/pico-limbo-native-windows-x86_64/windows/x86_64/pico_limbo.exe release/bin/windows-x86_64/
+          cp native/pico-limbo-native-macos-aarch64/macos/aarch64/pico_limbo release/bin/macos-aarch64/
+          cp build/pico_limbo_java_wrapper.jar release/
+          chmod +x release/bin/linux-x86_64/pico_limbo release/bin/linux-aarch64/pico_limbo release/bin/macos-aarch64/pico_limbo
+          cd release
+          sha256sum bin/linux-x86_64/pico_limbo bin/linux-aarch64/pico_limbo bin/windows-x86_64/pico_limbo.exe bin/macos-aarch64/pico_limbo pico_limbo_java_wrapper.jar > SHA256SUMS
+          zip -r ../pico-limbo-build.zip .
+      - name: Upload final build
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-build
+          path: |
+            release/
+            pico-limbo-build.zip
+          retention-days: 30
