@@ -183,3 +183,68 @@ jobs:
           name: pico-limbo-java-wrapper
           path: java_wrapper/wrapper/build/libs/*.jar
           if-no-files-found: error
+
+  package-release:
+    name: Package final build
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux
+      - build-macos
+      - build-windows
+      - build-java-wrapper
+    steps:
+      - name: Download Linux x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: pico-limbo-linux-x86_64
+          path: release/bin/linux-x86_64
+      - name: Download Linux aarch64
+        uses: actions/download-artifact@v4
+        with:
+          name: pico-limbo-linux-aarch64
+          path: release/bin/linux-aarch64
+      - name: Download Linux x86_64 musl
+        uses: actions/download-artifact@v4
+        with:
+          name: pico-limbo-linux-x86_64-musl
+          path: release/bin/linux-x86_64-musl
+      - name: Download Linux aarch64 musl
+        uses: actions/download-artifact@v4
+        with:
+          name: pico-limbo-linux-aarch64-musl
+          path: release/bin/linux-aarch64-musl
+      - name: Download macOS aarch64
+        uses: actions/download-artifact@v4
+        with:
+          name: pico-limbo-macos-aarch64
+          path: release/bin/macos-aarch64
+      - name: Download Windows x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: pico-limbo-windows-x86_64
+          path: release/bin/windows-x86_64
+      - name: Download Java wrapper
+        uses: actions/download-artifact@v4
+        with:
+          name: pico-limbo-java-wrapper
+          path: release
+      - name: Create final package
+        shell: bash
+        run: |
+          find release -type f -name '*.tar.gz' -exec sh -c 'for f; do d="${f%.tar.gz}"; mkdir -p "$d"; tar -xzf "$f" -C "$d"; rm "$f"; done' sh {} +
+          find release -type f -name '*.zip' -exec sh -c 'for f; do d="${f%.zip}"; mkdir -p "$d"; unzip -q "$f" -d "$d"; rm "$f"; done' sh {} +
+          find release -type f -name '*.jar' ! -name 'pico_limbo_java_wrapper.jar' -delete
+          find release -type f -name 'pico_limbo_java_wrapper.jar' -exec sh -c 'mv "$1" release/pico_limbo_java_wrapper.jar' sh {} \;
+          chmod +x release/bin/linux-x86_64/pico_limbo release/bin/linux-aarch64/pico_limbo release/bin/linux-x86_64-musl/pico_limbo release/bin/linux-aarch64-musl/pico_limbo release/bin/macos-aarch64/pico_limbo 2>/dev/null || true
+          find release -type f -print0 | sort -z | xargs -0 sha256sum > release/SHA256SUMS
+          cd release
+          zip -qr ../pico-limbo-build.zip .
+      - name: Upload final build
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-limbo-build
+          path: |
+            release/
+            pico-limbo-build.zip
+          if-no-files-found: error
+          retention-days: 30
