@@ -76,7 +76,7 @@ pub fn parse_mini_message(input: &str) -> Result<Component, MiniMessageError> {
                 input: input.to_string(),
             })? {
             Event::Start(e) => {
-                let tag_name = e.name().as_ref().to_string();
+                let tag_name = String::from_utf8(e.name().as_ref().to_vec()).unwrap_or_default();
 
                 if tag_name == "newline" {
                     if let Some(current_style) = style_stack.last() {
@@ -110,13 +110,19 @@ pub fn parse_mini_message(input: &str) -> Result<Component, MiniMessageError> {
                 }
             }
             Event::End(e) => {
-                let tag_name = e.name().as_ref().to_string();
+                let tag_name = String::from_utf8(e.name().as_ref().to_vec()).unwrap_or_default();
                 if is_styling_tag(&tag_name) && style_stack.len() > 1 {
                     style_stack.pop();
                 }
             }
             Event::Text(e) => {
-                let text = e.as_ref().to_string();
+                let text = e
+                    .decode()
+                    .map_err(|e| MiniMessageError::Encoding {
+                        source: e,
+                        input: input.to_string(),
+                    })?
+                    .to_string();
                 if text.is_empty() {
                     continue;
                 }
@@ -135,7 +141,7 @@ pub fn parse_mini_message(input: &str) -> Result<Component, MiniMessageError> {
                 }
             }
             Event::Empty(e) => {
-                let tag_name = e.name().as_ref().to_string();
+                let tag_name = String::from_utf8(e.name().as_ref().to_vec()).unwrap_or_default();
                 if tag_name == "newline"
                     && let Some(current_style) = style_stack.last()
                 {
