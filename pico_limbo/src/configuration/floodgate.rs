@@ -4,74 +4,118 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FloodgateConfig {
-    Disabled(DisabledFloodgateConfig),
     Enabled(EnabledFloodgateConfig),
+    Disabled(DisabledFloodgateConfig),
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EnabledFloodgateConfig {
     #[serde(deserialize_with = "require_true")]
     pub enabled: bool,
-    #[serde(default = "default_key_file")]
     pub key_file: String,
-    #[serde(default = "default_username_prefix")]
     pub username_prefix: String,
-    #[serde(default = "default_replace_spaces")]
     pub replace_spaces: bool,
-    #[serde(default)]
     pub education: bool,
-    #[serde(default = "default_education_username_prefix")]
     pub education_username_prefix: String,
-    #[serde(default)]
     pub education_uuid_legacy: bool,
+}
+
+impl Default for EnabledFloodgateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            key_file: "key.pem".into(),
+            username_prefix: ".".into(),
+            replace_spaces: true,
+            education: false,
+            education_username_prefix: "+".into(),
+            education_uuid_legacy: false,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools, dead_code)]
 pub struct DisabledFloodgateConfig {
     #[serde(deserialize_with = "require_false")]
     pub enabled: bool,
-    #[serde(default = "default_key_file")]
+
+    // These fields existed in the original PR schema. Keep accepting them while disabled so
+    // existing configs can be upgraded without silently changing the rest of PicoLimbo's config.
+    #[serde(default, skip_serializing)]
     pub key_file: String,
-    #[serde(default = "default_username_prefix")]
+    #[serde(default, skip_serializing)]
     pub username_prefix: String,
-    #[serde(default = "default_replace_spaces")]
+    #[serde(default, skip_serializing)]
     pub replace_spaces: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub education: bool,
-    #[serde(default = "default_education_username_prefix")]
+    #[serde(default, skip_serializing)]
     pub education_username_prefix: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub education_uuid_legacy: bool,
-}
-
-fn default_key_file() -> String {
-    "key.pem".to_string()
-}
-
-fn default_username_prefix() -> String {
-    ".".to_string()
-}
-
-fn default_replace_spaces() -> bool {
-    true
-}
-
-fn default_education_username_prefix() -> String {
-    "+".to_string()
 }
 
 impl Default for FloodgateConfig {
     fn default() -> Self {
         Self::Disabled(DisabledFloodgateConfig {
             enabled: false,
-            key_file: default_key_file(),
-            username_prefix: default_username_prefix(),
-            replace_spaces: default_replace_spaces(),
+            key_file: "key.pem".into(),
+            username_prefix: ".".into(),
+            replace_spaces: true,
             education: false,
-            education_username_prefix: default_education_username_prefix(),
+            education_username_prefix: "+".into(),
             education_uuid_legacy: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabled_config_fills_missing_values_from_defaults() {
+        let config: FloodgateConfig = toml::from_str(
+            r"
+            enabled = true
+            ",
+        )
+        .unwrap();
+
+        let FloodgateConfig::Enabled(config) = config else {
+            panic!("expected enabled configuration");
+        };
+
+        assert_eq!(config.key_file, "key.pem");
+        assert_eq!(config.username_prefix, ".");
+        assert!(config.replace_spaces);
+        assert!(!config.education);
+        assert_eq!(config.education_username_prefix, "+");
+        assert!(!config.education_uuid_legacy);
+    }
+
+    #[test]
+    fn disabled_config_migrates_old_optional_fields() {
+        let config: FloodgateConfig = toml::from_str(
+            r#"
+            enabled = false
+            key_file = "old-key.pem"
+            username_prefix = "."
+            replace_spaces = true
+            education = true
+            education_username_prefix = "+"
+            education_uuid_legacy = true
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(config, FloodgateConfig::Disabled(_)));
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(serialized.trim(), "enabled = false");
     }
 }

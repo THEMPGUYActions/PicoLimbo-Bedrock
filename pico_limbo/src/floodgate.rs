@@ -1,6 +1,5 @@
 use aes_gcm::{
-    Aes128Gcm,
-    Nonce,
+    Aes128Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
 use base64::Engine;
@@ -17,13 +16,13 @@ const VERSION: u8 = 0;
 const IV_LENGTH: usize = 12;
 const MAX_PAYLOAD_BYTES: usize = 8192;
 const MAX_CIPHERTEXT_BYTES: usize = 4096;
+const MAX_USERNAME_BYTES: usize = 16;
 const MAX_USERNAME_PREFIX_BYTES: usize = 16;
-const MAX_JAVA_USERNAME_BYTES: usize = 16;
-const EDUCATION_UUID_MSB: u64 = 0x0000000100000001;
+const EDUCATION_UUID_MSB: u64 = 0x0000_0001_0000_0001;
 
 #[derive(Clone)]
 pub struct FloodgateSettings {
-    key: Option<[u8; 16]>,
+    key: [u8; 16],
     education_enabled: bool,
     username_prefix: String,
     education_prefix: String,
@@ -31,7 +30,7 @@ pub struct FloodgateSettings {
     education_uuid_legacy: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloodgateData {
     pub username: String,
     pub xuid: String,
@@ -42,10 +41,10 @@ pub struct FloodgateData {
 impl Default for FloodgateSettings {
     fn default() -> Self {
         Self {
-            key: None,
+            key: [0; 16],
             education_enabled: false,
-            username_prefix: String::new(),
-            education_prefix: String::new(),
+            username_prefix: ".".into(),
+            education_prefix: "+".into(),
             replace_spaces: true,
             education_uuid_legacy: false,
         }
@@ -61,7 +60,7 @@ impl FloodgateSettings {
         )?;
 
         Ok(Self {
-            key: Some(load_key(&config.key_file)?),
+            key: load_key(&config.key_file)?,
             education_enabled: config.education,
             username_prefix: config.username_prefix.clone(),
             education_prefix: config.education_username_prefix.clone(),
@@ -74,44 +73,39 @@ impl FloodgateSettings {
         &self,
         hostname: &str,
     ) -> Result<(String, Option<FloodgateData>), String> {
-        let Some(key) = self.key.as_ref() else {
-            return Ok((hostname.to_string(), None));
-        };
-
         let mut clean_parts = Vec::new();
         let mut floodgate_data = None;
 
         for part in hostname.split('\0') {
-            if let Some(version) = floodgate_version(part.as_bytes()) {
-                if version != VERSION as i32 {
-                    return Err(format!("Unsupported Floodgate data version: {version}"));
-                }
-
-                if floodgate_data.is_some() {
-                    return Err("Multiple Floodgate payloads were provided".to_string());
-                }
-
-                let decrypted = decrypt(key, part)?;
-                let data = parse_data(&decrypted)?;
-
-                if data.education && !self.education_enabled {
-                    return Err(
-                        "Education Floodgate data received but education support is disabled"
-                            .to_string(),
-                    );
-                }
-
-                floodgate_data = Some(data);
-            } else {
+            let Some(version) = floodgate_version(part.as_bytes()) else {
                 clean_parts.push(part);
+                continue;
+            };
+
+            if version != i32::from(VERSION) {
+                return Err(format!("Unsupported Floodgate data version: {version}"));
             }
+            if floodgate_data.is_some() {
+                return Err("Multiple Floodgate payloads were provided".into());
+            }
+
+            let decrypted = decrypt(&self.key, part)?;
+            let data = parse_data(&decrypted)?;
+
+            if data.education && !self.education_enabled {
+                return Err(
+                    "Education Floodgate data was received but education support is disabled"
+                        .into(),
+                );
+            }
+
+            floodgate_data = Some(data);
         }
 
-        let Some(data) = floodgate_data else {
-            return Ok((hostname.to_string(), None));
-        };
-
-        Ok((clean_parts.join("\0"), Some(data)))
+        floodgate_data.map_or_else(
+            || Ok((hostname.to_owned(), None)),
+            |data| Ok((clean_parts.join("\0"), Some(data))),
+        )
     }
 
     pub fn game_profile(&self, data: &FloodgateData) -> Result<(String, Uuid), String> {
@@ -121,12 +115,10 @@ impl FloodgateSettings {
             &self.username_prefix
         };
 
-        let max_username_bytes = MAX_JAVA_USERNAME_BYTES.saturating_sub(prefix.len());
-        let username = format!(
-            "{}{}",
-            prefix,
-            truncate_utf8(&data.username, max_username_bytes)
-        );
+        let prefix_bytes = prefix.len();
+        let username_budget = MAX_USERNAME_BYTES.saturating_sub(prefix_bytes);
+        let username = truncate_utf8(&data.username, username_budget);
+        let username = format!("{prefix}{username}");
         let username = if self.replace_spaces {
             username.replace(' ', "_")
         } else {
@@ -137,14 +129,14 @@ impl FloodgateSettings {
             if self.education_uuid_legacy {
                 legacy_education_uuid(&data.tenant_id, &data.username)
             } else {
-                modern_education_uuid(&data.xuid)?
+                education_uuid(&data.xuid)?
             }
         } else {
             let xuid = data
                 .xuid
                 .parse::<i64>()
                 .map_err(|_| "Floodgate xuid is not a valid 64-bit integer".to_string())?;
-            Uuid::from_u64_pair(0, xuid as u64)
+            Uuid::from_u64_pair(0, xuid.cast_unsigned())
         };
 
         Ok((username, uuid))
@@ -158,7 +150,7 @@ fn load_key(value: &str) -> Result<[u8; 16], String> {
 
     if data.len() != 16 {
         return Err(format!(
-            "Floodgate AES key must be exactly 16 bytes, got {}",
+            "Floodgate key must contain exactly 16 raw AES-128 bytes, got {} bytes",
             data.len()
         ));
     }
@@ -178,17 +170,17 @@ fn floodgate_version(value: &[u8]) -> Option<i32> {
 
 fn decrypt(key: &[u8; 16], value: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
-    if bytes.len() <= HEADER.len() || !bytes.starts_with(HEADER) {
-        return Err("Invalid Floodgate header".to_string());
+    if !bytes.starts_with(HEADER) {
+        return Err("Invalid Floodgate header".into());
     }
 
     let payload = &bytes[HEADER.len()..];
     if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err("Floodgate payload is too large".to_string());
+        return Err("Floodgate payload is too large".into());
     }
 
     let Some(separator) = payload.iter().position(|byte| *byte == b'!') else {
-        return Err("Invalid Floodgate payload".to_string());
+        return Err("Invalid Floodgate payload".into());
     };
 
     let iv = base64::engine::general_purpose::STANDARD
@@ -199,18 +191,17 @@ fn decrypt(key: &[u8; 16], value: &str) -> Result<String, String> {
         .map_err(|_| "Invalid Floodgate ciphertext encoding".to_string())?;
 
     if iv.len() != IV_LENGTH {
-        return Err("Invalid Floodgate IV length".to_string());
+        return Err("Invalid Floodgate IV length".into());
     }
-
     if ciphertext.is_empty() || ciphertext.len() > MAX_CIPHERTEXT_BYTES {
-        return Err("Invalid Floodgate ciphertext length".to_string());
+        return Err("Invalid Floodgate ciphertext length".into());
     }
 
     let cipher =
         Aes128Gcm::new_from_slice(key).map_err(|_| "Invalid Floodgate AES key".to_string())?;
-    let nonce = Nonce::from_slice(&iv);
+    let nonce = Nonce::try_from(&iv[..]).map_err(|_| "Invalid Floodgate IV length".to_string())?;
     let plaintext = cipher
-        .decrypt(nonce, ciphertext.as_ref())
+        .decrypt(&nonce, ciphertext.as_ref())
         .map_err(|_| "Floodgate authentication failed".to_string())?;
 
     String::from_utf8(plaintext).map_err(|_| "Floodgate data is not valid UTF-8".to_string())
@@ -219,38 +210,45 @@ fn decrypt(key: &[u8; 16], value: &str) -> Result<String, String> {
 fn parse_data(data: &str) -> Result<FloodgateData, String> {
     let fields: Vec<&str> = data.split('\0').collect();
 
-    match fields.len() {
-        12 => {}
-        15 if fields[12] == "1" => {}
-        length => {
-            return Err(format!("Invalid Floodgate data field count: {length}"));
-        }
+    if fields.len() != 12 && fields.len() != 15 {
+        return Err(format!(
+            "Invalid Floodgate data field count: {}",
+            fields.len()
+        ));
     }
 
     if fields[9] != "0" && fields[9] != "1" {
-        return Err("Invalid Floodgate proxy flag".to_string());
+        return Err("Invalid Floodgate proxy flag".into());
     }
 
-    let education = fields.len() == 15;
-    let tenant_id = if education {
-        fields[13].to_string()
+    let education = if fields.len() == 15 {
+        match fields[12] {
+            "0" => false,
+            "1" => true,
+            _ => return Err("Invalid Education Floodgate flag".into()),
+        }
     } else {
-        String::new()
+        false
     };
+
     Ok(FloodgateData {
-        username: fields[1].to_string(),
-        xuid: fields[2].to_string(),
+        username: fields[1].to_owned(),
+        xuid: fields[2].to_owned(),
         education,
-        tenant_id,
+        tenant_id: if education {
+            fields[13].to_owned()
+        } else {
+            String::new()
+        },
     })
 }
 
-fn modern_education_uuid(oid: &str) -> Result<Uuid, String> {
+fn education_uuid(oid: &str) -> Result<Uuid, String> {
     let parsed = uuid::Uuid::parse_str(oid)
         .map_err(|_| "EduFloodgate xuid is not a valid Entra OID".to_string())?;
     let value = parsed.as_u128();
     let msb = (value >> 64) as u64;
-    let lsb = value as u64;
+    let lsb = u64::try_from(value & u128::from(u64::MAX)).expect("value was masked to 64 bits");
 
     let upper = ((msb >> 16) << 12) | (msb & 0xFFF);
     let lower = (lsb << 2) >> 60;
@@ -288,7 +286,7 @@ fn validate_prefix(prefix: &str, name: &str) -> Result<(), String> {
 
 fn truncate_utf8(value: &str, max: usize) -> String {
     if value.len() <= max {
-        return value.to_string();
+        return value.to_owned();
     }
 
     let mut end = max;
@@ -296,30 +294,29 @@ fn truncate_utf8(value: &str, max: usize) -> String {
         end -= 1;
     }
 
-    value[..end].to_string()
+    value[..end].to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::Aead;
 
     fn settings(key: [u8; 16]) -> FloodgateSettings {
         FloodgateSettings {
-            key: Some(key),
+            key,
             education_enabled: true,
-            username_prefix: ".".to_string(),
-            education_prefix: "+".to_string(),
+            username_prefix: ".".into(),
+            education_prefix: "+".into(),
             replace_spaces: true,
             education_uuid_legacy: false,
         }
     }
 
-    fn payload(key: [u8; 16], data: &str) -> String {
+    fn encrypted_hostname(key: [u8; 16], data: &str) -> String {
         let cipher = Aes128Gcm::new_from_slice(&key).unwrap();
         let iv = [7u8; IV_LENGTH];
-        let nonce = Nonce::from_slice(&iv);
-        let ciphertext = cipher.encrypt(nonce, data.as_bytes()).unwrap();
+        let nonce = Nonce::try_from(&iv[..]).expect("valid test nonce");
+        let ciphertext = cipher.encrypt(&nonce, data.as_bytes()).unwrap();
 
         format!(
             "{}{}!{}",
@@ -329,61 +326,158 @@ mod tests {
         )
     }
 
+    fn standard_data() -> String {
+        [
+            "0",
+            "Player",
+            "123456789",
+            "1",
+            "en_US",
+            "0",
+            "1",
+            "127.0.0.1",
+            "",
+            "0",
+            "123",
+            "verify",
+        ]
+        .join("\0")
+    }
+
+    fn education_data() -> String {
+        [
+            "0",
+            "Student",
+            "00000000-0000-4000-8000-000000000001",
+            "1",
+            "en_US",
+            "0",
+            "1",
+            "127.0.0.1",
+            "",
+            "1",
+            "123",
+            "verify",
+            "1",
+            "tenant",
+            "0",
+        ]
+        .join("\0")
+    }
+
+    fn bedrock_data_with_education_fields() -> String {
+        [
+            "0",
+            "Player",
+            "123456789",
+            "1",
+            "en_US",
+            "0",
+            "1",
+            "127.0.0.1",
+            "",
+            "0",
+            "123",
+            "verify",
+            "0",
+            "",
+            "-1",
+        ]
+        .join("\0")
+    }
+
     #[test]
     fn decrypts_standard_floodgate_payload() {
         let key = [1u8; 16];
-        let data = "0\0Player\0-1\01\0en_US\02\01\0127.0.0.1\0\00\00\0123\0verify";
-        let encoded = payload(key, data);
+        let encoded = encrypted_hostname(key, &standard_data());
+
         let (hostname, parsed) = settings(key)
             .parse_hostname(&format!("lobby\0{encoded}\0example"))
             .unwrap();
 
         assert_eq!(hostname, "lobby\0example");
         let data = parsed.unwrap();
+        assert_eq!(
+            data,
+            FloodgateData {
+                username: "Player".into(),
+                xuid: "123456789".into(),
+                education: false,
+                tenant_id: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_non_education_15_field_payload_when_education_disabled() {
+        let key = [7u8; 16];
+        let encoded = encrypted_hostname(key, &bedrock_data_with_education_fields());
+        let mut settings = settings(key);
+        settings.education_enabled = false;
+
+        let (_, parsed) = settings.parse_hostname(&encoded).unwrap();
+        let data = parsed.unwrap();
+
         assert_eq!(data.username, "Player");
+        assert_eq!(data.xuid, "123456789");
         assert!(!data.education);
-        assert_eq!(data.xuid, "-1");
+        assert!(data.tenant_id.is_empty());
+
+        let (username, uuid) = settings.game_profile(&data).unwrap();
+        assert_eq!(username, ".Player");
+        assert_eq!(uuid, Uuid::from_u64_pair(0, 123_456_789));
     }
 
     #[test]
     fn rejects_multiple_payloads() {
         let key = [2u8; 16];
-        let data = "0\0Player\00\01\0en_US\02\01\0127.0.0.1\0\00\00\0123\0verify";
-        let encoded = payload(key, data);
-        assert!(settings(key)
-            .parse_hostname(&format!("{encoded}\0{encoded}"))
-            .is_err());
+        let encoded = encrypted_hostname(key, &standard_data());
+        assert!(
+            settings(key)
+                .parse_hostname(&format!("{encoded}\0{encoded}"))
+                .is_err()
+        );
     }
 
     #[test]
-    fn parses_modern_education_uuid() {
-        let data = parse_data(
-            "0\0Student\000000000-0000-4000-8000-000000000001\01\0en_US\02\01\0127.0.0.1\0\00\00\0123\0verify\01\0tenant\00",
-        )
-        .unwrap();
-
-        let (_, uuid) = settings([3u8; 16]).game_profile(&data).unwrap();
-        let expected = modern_education_uuid("00000000-0000-4000-8000-000000000001").unwrap();
-        assert_eq!(uuid, expected);
+    fn rejects_education_when_disabled() {
+        let key = [3u8; 16];
+        let encoded = encrypted_hostname(key, &education_data());
+        let mut settings = settings(key);
+        settings.education_enabled = false;
+        assert!(settings.parse_hostname(&encoded).is_err());
     }
 
     #[test]
-    fn parses_legacy_education_uuid() {
-        let data = parse_data(
-            "0\0Student\00\01\0en_US\02\01\0127.0.0.1\0\00\00\0123\0verify\01\0tenant\00",
-        )
-        .unwrap();
+    fn builds_standard_game_profile() {
+        let settings = settings([4u8; 16]);
+        let data = parse_data(&standard_data()).unwrap();
+        let (username, uuid) = settings.game_profile(&data).unwrap();
 
-        let mut settings = settings([4u8; 16]);
-        settings.education_uuid_legacy = true;
+        assert_eq!(username, ".Player");
+        assert_eq!(uuid, Uuid::from_u64_pair(0, 123_456_789));
+    }
+
+    #[test]
+    fn builds_modern_education_uuid() {
+        let settings = settings([5u8; 16]);
+        let data = parse_data(&education_data()).unwrap();
         let (_, uuid) = settings.game_profile(&data).unwrap();
-
-        let expected = legacy_education_uuid("tenant", "Student");
+        let expected = education_uuid("00000000-0000-4000-8000-000000000001").unwrap();
         assert_eq!(uuid, expected);
     }
 
     #[test]
-    fn truncates_utf8_usernames() {
+    fn builds_legacy_education_uuid() {
+        let mut settings = settings([6u8; 16]);
+        settings.education_uuid_legacy = true;
+        let data = parse_data(&education_data()).unwrap();
+        let (_, uuid) = settings.game_profile(&data).unwrap();
+        assert_eq!(uuid, legacy_education_uuid("tenant", "Student"));
+    }
+
+    #[test]
+    fn truncates_utf8_without_splitting() {
         assert_eq!(truncate_utf8("ééé", 3), "é");
         assert_eq!(truncate_utf8("abcdef", 3), "abc");
     }
